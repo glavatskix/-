@@ -80,7 +80,7 @@ def api_get(endpoint, params):
         raise RuntimeError(f"YouTube API вернул ошибку ({e.code}): {reason}")
 
 
-def search_recent_long_videos(keyword, days_back=30, max_pages=3):
+def search_recent_long_videos(keyword, days_back=30, max_pages=1):
     published_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     all_items = []
     next_page = None
@@ -132,7 +132,7 @@ def get_first_video_date(uploads_playlist_id):
     earliest = None
     next_page = None
     fetched = 0
-    while fetched < 500:
+    while fetched < 150:  # уменьшено со 500 ради скорости — важно уложиться в тайм-аут
         params = {"part": "snippet", "playlistId": uploads_playlist_id, "maxResults": 50,
                    "key": YOUTUBE_API_KEY}
         if next_page:
@@ -170,6 +170,8 @@ def run_check():
     seen_ids = load_seen_ids()
     found = []
     errors = []
+    age_checks_done = 0
+    MAX_AGE_CHECKS_PER_RUN = 15  # самая медленная операция — ограничиваем, чтобы не упереться в тайм-аут
 
     for kw in KEYWORDS:
         try:
@@ -193,8 +195,11 @@ def run_check():
                 subs = int(cdata["statistics"].get("subscriberCount", 0))
                 if views < MIN_VIEWS or subs > MAX_SUBS:
                     continue  # пока не подходит — проверим ещё раз в следующий вызов
+                if age_checks_done >= MAX_AGE_CHECKS_PER_RUN:
+                    continue  # отложим до следующего вызова — не проверено, не помечаем как seen
                 uploads_playlist = cdata["contentDetails"]["relatedPlaylists"]["uploads"]
                 first_video_date = get_first_video_date(uploads_playlist)
+                age_checks_done += 1
                 if not first_video_date:
                     continue
                 channel_age_days = (datetime.now(timezone.utc) -
