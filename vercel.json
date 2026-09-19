@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/monitor.py": {
+      "maxDuration": 60
+    }
+  }
+}
