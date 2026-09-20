@@ -1,4 +1,3 @@
-# force rebuild
 """
 Мониторинг залетевших молодых музыкальных каналов — версия для бесплатного serverless
 (Vercel), без Mac. Работает по принципу "разбудили — проверили — уснули": вся логика
@@ -39,8 +38,10 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 MIN_VIEWS = int(os.environ.get("MONITOR_MIN_VIEWS", "5000"))
 MAX_SUBS = int(os.environ.get("MONITOR_MAX_SUBS", "10000"))
 MAX_AGE_DAYS = int(os.environ.get("MONITOR_MAX_AGE_DAYS", "30"))
-KEYWORDS = [k.strip() for k in os.environ.get("MONITOR_KEYWORDS", "").split(",") if k.strip()] or \
-    ["long mix", "dj set", "hours", "sleep music"]
+KEYWORDS = [k.strip() for k in os.environ.get("MONITOR_KEYWORDS", "").split(",") if k.strip()] or [""]
+# Пустая строка — это осознанный широкий поиск по ВСЕЙ категории "Музыка" (плюс длинный
+# формат), без сужения до конкретных слов. Раньше это не работало из-за отдельного бага
+# с лимитом в 50 ID на пачку — он уже исправлен, так что теперь это безопасно и работает.
 
 
 def redis_command(*args):
