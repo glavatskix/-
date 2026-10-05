@@ -1,27 +1,40 @@
 """
-Мониторинг залетевших молодых музыкальных каналов — версия для бесплатного serverless
-(Vercel), без Mac. Работает по принципу "разбудили — проверили — уснули": вся логика
-выполняется за ОДИН вызов, а сам вызов делает внешний бесплатный планировщик
-(cron-job.org), который стучится сюда каждые несколько часов.
+Мониторинг залетевших видео у МОЛОДЫХ музыкальных каналов — весь YouTube-раздел "Музыка",
+без ключевых слов. Версия для бесплатного serverless (Vercel): "разбудили — проверили —
+уснули". Вызов делает внешний планировщик (cron-job.org) 1-2 раза в сутки.
+
+Как это работает (коротко):
+  1. Берём длинные видео (20+ минут) категории "Музыка" за последние DAYS_BACK дней
+     и режем это окно на отдельные дни. В каждом дне берём топ по просмотрам.
+     Так свежие видео не теряются за старыми гигантами, как было раньше.
+  2. Оставляем видео с просмотрами >= MIN_VIEWS у каналов с подписчиками <= MAX_SUBS.
+  3. Канал считается молодым, если он создан не раньше MAX_AGE_DAYS дней назад.
+     Если канал создан давно, но у него мало видео (<= 50), смотрим дату первого видео.
+  4. Шлём в Telegram, запоминаем отправленное в Upstash Redis, чтобы не повторяться.
 
 Переменные окружения (в панели Vercel):
-  YOUTUBE_API_KEY           — тот же ключ, что в Niche Scout
-  TELEGRAM_TOKEN            — токен бота (тот же, что уже используешь)
-  TELEGRAM_CHAT_ID          — твой числовой chat ID (узнать через @userinfobot)
-  UPSTASH_REDIS_REST_URL    — та же база, что у бота, или отдельная
-  UPSTASH_REDIS_REST_TOKEN
-  MONITOR_SECRET            — придуманный тобой пароль для защиты адреса от посторонних
-  MONITOR_KEYWORDS          — необязательно, через запятую (например "long mix,dj set,hours")
-  MONITOR_MIN_VIEWS         — необязательно, по умолчанию 5000
-  MONITOR_MAX_SUBS          — необязательно, по умолчанию 10000
-  MONITOR_MAX_AGE_DAYS      — необязательно, по умолчанию 30
+  YOUTUBE_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+  UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, MONITOR_SECRET  — как и раньше.
+  Необязательные (если не заданы — работают значения по умолчанию):
+  MONITOR_MIN_VIEWS        — минимум просмотров у видео, по умолчанию 5000
+  MONITOR_MAX_SUBS         — максимум подписчиков у канала, по умолчанию 10000
+  MONITOR_MAX_AGE_DAYS     — максимальный возраст канала в днях, по умолчанию 30
+  MONITOR_DAYS_BACK        — за сколько последних дней искать видео, по умолчанию 10
+  MONITOR_PAGES_PER_DAY    — сколько страниц по 50 видео брать на каждый день, по умолчанию 2
+  MONITOR_MAX_ALERTS       — максимум уведомлений за один запуск, по умолчанию 15
+
+Квота YouTube API: один запуск тратит DAYS_BACK x PAGES_PER_DAY x 100 единиц на поиск
+(по умолчанию 10 x 2 x 100 = 2000) плюс несколько десятков единиц на статистику.
+Дневной лимит ключа — 10 000 единиц, и он общий со всеми твоими программами на этом ключе.
 """
 
 import os
 import json
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import requests
 from flask import Flask, request, jsonify
@@ -38,40 +51,48 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 MIN_VIEWS = int(os.environ.get("MONITOR_MIN_VIEWS", "5000"))
 MAX_SUBS = int(os.environ.get("MONITOR_MAX_SUBS", "10000"))
 MAX_AGE_DAYS = int(os.environ.get("MONITOR_MAX_AGE_DAYS", "30"))
-KEYWORDS = [k.strip() for k in os.environ.get("MONITOR_KEYWORDS", "").split(",") if k.strip()] or [""]
-# Пустая строка — это осознанный широкий поиск по ВСЕЙ категории "Музыка" (плюс длинный
-# формат), без сужения до конкретных слов. Раньше это не работало из-за отдельного бага
-# с лимитом в 50 ID на пачку — он уже исправлен, так что теперь это безопасно и работает.
+DAYS_BACK = int(os.environ.get("MONITOR_DAYS_BACK", "10"))
+PAGES_PER_DAY = int(os.environ.get("MONITOR_PAGES_PER_DAY", "2"))
+MAX_ALERTS = int(os.environ.get("MONITOR_MAX_ALERTS", "15"))
 
+MAX_AGE_CHECKS = 20      # сколько "старых, но маленьких" каналов проверять по первому видео за запуск
+TIME_BUDGET_SEC = 24     # cron-job.org ждёт ответ максимум 30 секунд — страхуемся
+SEEN_LIMIT = 3000        # сколько последних отправленных/отброшенных видео помнить
+
+
+# ---------------------------------------------------------------- Redis (память "что уже видели")
 
 def redis_command(*args):
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return None
     resp = requests.post(UPSTASH_URL, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-                          json=list(args), timeout=10)
+                         json=list(args), timeout=10)
     resp.raise_for_status()
     return resp.json().get("result")
 
 
 def load_seen_ids():
+    """Возвращает список в порядке добавления (старые — в начале)."""
     raw = redis_command("GET", "monitor:seen_ids")
     if not raw:
-        return set()
+        return []
     try:
-        return set(json.loads(raw))
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
     except Exception:
-        return set()
+        return []
 
 
-def save_seen_ids(seen_ids):
-    trimmed = list(seen_ids)[-2000:]  # не даём списку расти бесконечно
-    redis_command("SET", "monitor:seen_ids", json.dumps(trimmed))
+def save_seen_ids(seen_list):
+    redis_command("SET", "monitor:seen_ids", json.dumps(seen_list[-SEEN_LIMIT:]))
 
+
+# ---------------------------------------------------------------- YouTube API
 
 def api_get(endpoint, params):
     url = f"https://www.googleapis.com/youtube/v3/{endpoint}?" + urllib.parse.urlencode(params)
     try:
-        with urllib.request.urlopen(url, timeout=20) as resp:
+        with urllib.request.urlopen(url, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -82,149 +103,216 @@ def api_get(endpoint, params):
         raise RuntimeError(f"YouTube API вернул ошибку ({e.code}): {reason}")
 
 
-def search_recent_long_videos(keyword, days_back=30, max_pages=1):
-    published_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    all_items = []
-    next_page = None
-    for _ in range(max_pages):
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_dt(s):
+    return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def search_window(start, end):
+    """Топ по просмотрам среди длинных музыкальных видео, опубликованных между start и end."""
+    items, token = [], None
+    for _ in range(PAGES_PER_DAY):
         params = {
             "part": "snippet", "type": "video", "videoDuration": "long", "order": "viewCount",
-            "publishedAfter": published_after, "maxResults": 50, "videoCategoryId": "10",
-            "key": YOUTUBE_API_KEY,
+            "videoCategoryId": "10", "maxResults": 50,
+            "publishedAfter": iso(start), "publishedBefore": iso(end), "key": YOUTUBE_API_KEY,
         }
-        if keyword:
-            params["q"] = keyword
-        if next_page:
-            params["pageToken"] = next_page
+        if token:
+            params["pageToken"] = token
         data = api_get("search", params)
-        all_items.extend(data.get("items", []))
-        next_page = data.get("nextPageToken")
-        if not next_page:
+        items.extend(data.get("items", []))
+        token = data.get("nextPageToken")
+        if not token:
             break
-    return all_items
+    return items
 
 
-def get_video_stats(video_ids):
-    if not video_ids:
-        return {}
-    result = {}
-    for i in range(0, len(video_ids), 50):  # YouTube принимает максимум 50 id за раз
-        batch = video_ids[i:i + 50]
-        data = api_get("videos", {"part": "statistics,snippet,contentDetails",
-                                    "id": ",".join(batch), "key": YOUTUBE_API_KEY})
-        for item in data.get("items", []):
-            result[item["id"]] = item
-    return result
+def fetch_batches(endpoint, part, ids, errors):
+    """Статистика пачками по 50 id (максимум YouTube), пачки идут параллельно."""
+    batches = [ids[i:i + 50] for i in range(0, len(ids), 50)]
 
-
-def get_channel_stats(channel_ids):
-    if not channel_ids:
-        return {}
-    result = {}
-    for i in range(0, len(channel_ids), 50):
-        batch = channel_ids[i:i + 50]
-        data = api_get("channels", {"part": "statistics,snippet,contentDetails",
-                                      "id": ",".join(batch), "key": YOUTUBE_API_KEY})
-        for item in data.get("items", []):
-            result[item["id"]] = item
-    return result
-
-
-def get_first_video_date(uploads_playlist_id):
-    earliest = None
-    next_page = None
-    fetched = 0
-    while fetched < 150:  # уменьшено со 500 ради скорости — важно уложиться в тайм-аут
-        params = {"part": "snippet", "playlistId": uploads_playlist_id, "maxResults": 50,
-                   "key": YOUTUBE_API_KEY}
-        if next_page:
-            params["pageToken"] = next_page
+    def one(batch):
         try:
-            data = api_get("playlistItems", params)
-        except Exception:
-            break
-        items = data.get("items", [])
-        for item in items:
-            published = item["snippet"]["publishedAt"]
-            if earliest is None or published < earliest:
-                earliest = published
-        fetched += len(items)
-        next_page = data.get("nextPageToken")
-        if not next_page:
-            break
-    return earliest
+            data = api_get(endpoint, {"part": part, "id": ",".join(batch), "key": YOUTUBE_API_KEY})
+            return data.get("items", [])
+        except Exception as e:
+            errors.append(str(e))
+            return []
 
+    result = {}
+    if not batches:
+        return result
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for items in ex.map(one, batches):
+            for item in items:
+                result[item["id"]] = item
+    return result
+
+
+def first_video_date(uploads_playlist_id):
+    """Для каналов с <= 50 видео одной страницы хватает, чтобы найти самое раннее."""
+    try:
+        data = api_get("playlistItems", {"part": "snippet", "playlistId": uploads_playlist_id,
+                                         "maxResults": 50, "key": YOUTUBE_API_KEY})
+    except Exception:
+        return None
+    dates = [it["snippet"]["publishedAt"] for it in data.get("items", [])
+             if it.get("snippet", {}).get("publishedAt")]
+    return min(dates) if dates else None
+
+
+# ---------------------------------------------------------------- Telegram
 
 def telegram_send_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                                    "disable_web_page_preview": False}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram отклонил сообщение: {data.get('description', data)}")
 
 
+# ---------------------------------------------------------------- основная проверка
+
 def run_check():
     if not YOUTUBE_API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return {"error": "Не заданы обязательные переменные окружения "
-                          "(YOUTUBE_API_KEY / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)"}
+                         "(YOUTUBE_API_KEY / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)"}
 
-    seen_ids = load_seen_ids()
-    found = []
+    t0 = time.time()
+    now = datetime.now(timezone.utc)
     errors = []
-    age_checks_done = 0
-    MAX_AGE_CHECKS_PER_RUN = 15  # самая медленная операция — ограничиваем, чтобы не упереться в тайм-аут
+    found = []
+    stats = {"days_searched": DAYS_BACK, "pool": 0, "already_seen": 0, "views_ok": 0,
+             "subs_ok": 0, "young": 0, "alerts_sent": 0}
 
-    for kw in KEYWORDS:
-        try:
-            items = search_recent_long_videos(kw)
-            video_ids = [it["id"]["videoId"] for it in items if "videoId" in it.get("id", {})]
-            channel_ids = list({it["snippet"]["channelId"] for it in items if "channelId" in it.get("snippet", {})})
-            if not video_ids:
+    try:
+        seen_list = load_seen_ids()
+    except Exception as e:
+        seen_list = []
+        errors.append(f"Redis (чтение): {e}")
+    seen = set(seen_list)
+
+    def mark_seen(vid):
+        if vid not in seen:
+            seen.add(vid)
+            seen_list.append(vid)
+
+    # 1. Поиск: каждый день отдельным окном, окна идут параллельно
+    windows = [(now - timedelta(days=i + 1), now - timedelta(days=i)) for i in range(DAYS_BACK)]
+    items = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = [ex.submit(search_window, s, e) for s, e in windows]
+        for f in futures:
+            try:
+                items.extend(f.result())
+            except Exception as e:
+                errors.append(str(e))
+
+    videos = {}
+    for it in items:
+        vid = it.get("id", {}).get("videoId")
+        if vid and vid not in videos and it.get("snippet", {}).get("channelId"):
+            videos[vid] = it
+    stats["pool"] = len(videos)
+
+    fresh = [v for v in videos if v not in seen]
+    stats["already_seen"] = len(videos) - len(fresh)
+
+    # 2. Просмотры
+    vdata = fetch_batches("videos", "statistics", fresh, errors)
+    popular = []
+    for vid in fresh:
+        v = vdata.get(vid)
+        if v and int(v.get("statistics", {}).get("viewCount", 0)) >= MIN_VIEWS:
+            popular.append(vid)
+    popular.sort(key=lambda v: int(vdata[v]["statistics"].get("viewCount", 0)), reverse=True)
+    stats["views_ok"] = len(popular)
+
+    # 3. Каналы — только для тех, у кого видео уже набрало просмотры
+    channel_ids = list({videos[v]["snippet"]["channelId"] for v in popular})
+    cdata = fetch_batches("channels", "statistics,snippet,contentDetails", channel_ids, errors)
+
+    candidates = []
+    age_checks = 0
+    for vid in popular:
+        cid = videos[vid]["snippet"]["channelId"]
+        c = cdata.get(cid)
+        if not c:
+            continue
+        cstats = c.get("statistics", {})
+        subs = None if cstats.get("hiddenSubscriberCount") else int(cstats.get("subscriberCount", 0))
+        if subs is not None and subs > MAX_SUBS:
+            continue
+        stats["subs_ok"] += 1
+
+        created_days = (now - parse_dt(c["snippet"]["publishedAt"])).days
+        video_count = int(cstats.get("videoCount", 0))
+        channel_age = created_days
+
+        if created_days > MAX_AGE_DAYS:
+            # канал создан давно — но мог начать выкладывать недавно. Проверяем только маленькие каналы
+            if video_count > 50:
+                mark_seen(vid)  # большой старый канал — больше не проверяем это видео
                 continue
-            video_data = get_video_stats(video_ids)
-            channel_data = get_channel_stats(channel_ids)
+            if age_checks >= MAX_AGE_CHECKS or time.time() - t0 > TIME_BUDGET_SEC:
+                continue  # не успели проверить — не помечаем, вернёмся в следующий запуск
+            first = first_video_date(c["contentDetails"]["relatedPlaylists"]["uploads"])
+            age_checks += 1
+            if not first:
+                continue
+            channel_age = (now - parse_dt(first)).days
+            if channel_age > MAX_AGE_DAYS:
+                mark_seen(vid)
+                continue
 
-            for it in items:
-                vid = it["id"].get("videoId")
-                if not vid or vid in seen_ids:
-                    continue
-                cid = it["snippet"]["channelId"]
-                vdata, cdata = video_data.get(vid), channel_data.get(cid)
-                if not vdata or not cdata:
-                    continue
-                views = int(vdata["statistics"].get("viewCount", 0))
-                subs = int(cdata["statistics"].get("subscriberCount", 0))
-                if views < MIN_VIEWS or subs > MAX_SUBS:
-                    continue  # пока не подходит — проверим ещё раз в следующий вызов
-                if age_checks_done >= MAX_AGE_CHECKS_PER_RUN:
-                    continue  # отложим до следующего вызова — не проверено, не помечаем как seen
-                uploads_playlist = cdata["contentDetails"]["relatedPlaylists"]["uploads"]
-                first_video_date = get_first_video_date(uploads_playlist)
-                age_checks_done += 1
-                if not first_video_date:
-                    continue
-                channel_age_days = (datetime.now(timezone.utc) -
-                                     datetime.strptime(first_video_date[:10], "%Y-%m-%d").replace(
-                                         tzinfo=timezone.utc)).days
-                if channel_age_days > MAX_AGE_DAYS:
-                    seen_ids.add(vid)  # возраст назад не пойдёт — исключаем насовсем
-                    continue
+        stats["young"] += 1
+        candidates.append({
+            "vid": vid, "cid": cid, "subs": subs, "channel_age": channel_age,
+            "video_count": video_count,
+        })
 
-                title = it["snippet"]["title"]
-                channel_title = it["snippet"].get("channelTitle", "?")
-                url = f"https://www.youtube.com/watch?v={vid}"
-                message = (f"🚀 Залетевшее видео у молодого канала!\n\n"
-                           f"Канал: {channel_title} (ведётся {channel_age_days} дн., {subs} подписчиков)\n"
-                           f"Видео: {title}\nПросмотров: {views:,}".replace(",", " ") + f"\n{url}")
-                seen_ids.add(vid)
-                telegram_send_message(message)
-                found.append({"title": title, "channel": channel_title, "views": views, "url": url})
+    # 4. Уведомления (самые просматриваемые первыми, не больше MAX_ALERTS за запуск)
+    for cand in candidates[:MAX_ALERTS]:
+        vid = cand["vid"]
+        snippet = videos[vid]["snippet"]
+        views = int(vdata[vid]["statistics"].get("viewCount", 0))
+        video_days = max(1, (now - parse_dt(snippet["publishedAt"])).days)
+        subs_text = "подписчики скрыты" if cand["subs"] is None else f"{cand['subs']} подписчиков"
+        title = snippet.get("title", "?")
+        channel_title = snippet.get("channelTitle", "?")
+        url = f"https://www.youtube.com/watch?v={vid}"
+        views_text = f"{views:,}".replace(",", " ")
+        message = (
+            f"🚀 Залетевшее видео у молодого канала!\n\n"
+            f"Канал: {channel_title} (ведётся {cand['channel_age']} дн., {cand['video_count']} видео, "
+            f"{subs_text})\n"
+            f"https://www.youtube.com/channel/{cand['cid']}\n\n"
+            f"Видео: {title}\n"
+            f"Просмотров: {views_text} за {video_days} дн.\n{url}"
+        )
+        try:
+            telegram_send_message(message)
         except Exception as e:
-            errors.append(f"{kw}: {e}")
+            errors.append(f"Telegram: {e}")
+            break  # не помечаем как отправленное — повторим в следующий запуск
+        mark_seen(vid)
+        found.append({"title": title, "channel": channel_title, "views": views, "url": url})
+    stats["alerts_sent"] = len(found)
+    stats["waiting_for_next_run"] = max(0, len(candidates) - len(found))
 
-    save_seen_ids(seen_ids)
-    return {"found": found, "errors": errors, "checked_keywords": KEYWORDS}
+    try:
+        save_seen_ids(seen_list)
+    except Exception as e:
+        errors.append(f"Redis (запись): {e}")
+
+    stats["seconds"] = round(time.time() - t0, 1)
+    return {"found": found, "errors": sorted(set(errors)), "stats": stats,
+            "redis_configured": bool(UPSTASH_URL and UPSTASH_TOKEN)}
 
 
 @app.route("/", methods=["GET", "POST"])
