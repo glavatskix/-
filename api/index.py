@@ -166,10 +166,15 @@ def first_video_date(uploads_playlist_id):
 
 # ---------------------------------------------------------------- Telegram
 
-def telegram_send_message(text):
+def telegram_send_message(text, preview_url=None):
+    """preview_url — ссылка, для которой Telegram покажет карточку с обложкой видео.
+    Без неё карточка строится по ПЕРВОЙ ссылке в тексте (раньше это была ссылка на канал,
+    поэтому обложки видео не было)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                                    "disable_web_page_preview": False}, timeout=30)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if preview_url:
+        payload["link_preview_options"] = {"url": preview_url, "prefer_large_media": True}
+    resp = requests.post(url, json=payload, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
@@ -291,12 +296,13 @@ def run_check():
             f"🚀 Залетевшее видео у молодого канала!\n\n"
             f"Канал: {channel_title} (ведётся {cand['channel_age']} дн., {cand['video_count']} видео, "
             f"{subs_text})\n"
-            f"https://www.youtube.com/channel/{cand['cid']}\n\n"
             f"Видео: {title}\n"
-            f"Просмотров: {views_text} за {video_days} дн.\n{url}"
+            f"Просмотров: {views_text} за {video_days} дн.\n"
+            f"{url}\n\n"
+            f"Канал: https://www.youtube.com/channel/{cand['cid']}"
         )
         try:
-            telegram_send_message(message)
+            telegram_send_message(message, preview_url=url)
         except Exception as e:
             errors.append(f"Telegram: {e}")
             break  # не помечаем как отправленное — повторим в следующий запуск
